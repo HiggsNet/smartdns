@@ -21,11 +21,14 @@
 #endif
 #include "util.h"
 #include "dns_conf.h"
+#include "tlog.h"
 #include <arpa/inet.h>
+#include <dlfcn.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/capability.h>
+#include <linux/limits.h>
 #include <linux/netlink.h>
 #include <netinet/tcp.h>
 #include <openssl/crypto.h>
@@ -39,6 +42,7 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#include <unwind.h>
 
 #define TMP_BUFF_LEN_32 32
 
@@ -514,6 +518,7 @@ static int _ipset_operate(const char *ipsetname, const unsigned char addr[], int
 	ssize_t rc;
 	int af = 0;
 	static const struct sockaddr_nl snl = {.nl_family = AF_NETLINK};
+	uint32_t expire;
 
 	if (addr_len != IPV4_ADDR_LEN && addr_len != IPV6_ADDR_LEN) {
 		errno = EINVAL;
@@ -568,8 +573,8 @@ static int _ipset_operate(const char *ipsetname, const unsigned char addr[], int
 	nested[1]->len = (void *)buffer + NETLINK_ALIGN(netlink_head->nlmsg_len) - (void *)nested[1];
 
 	if (timeout > 0 && _ipset_support_timeout(ipsetname) == 0) {
-		timeout = htonl(timeout);
-		_ipset_add_attr(netlink_head, IPSET_ATTR_TIMEOUT | NLA_F_NET_BYTEORDER, sizeof(timeout), &timeout);
+		expire = htonl(timeout);
+		_ipset_add_attr(netlink_head, IPSET_ATTR_TIMEOUT | NLA_F_NET_BYTEORDER, sizeof(expire), &expire);
 	}
 
 	nested[0]->len = (void *)buffer + NETLINK_ALIGN(netlink_head->nlmsg_len) - (void *)nested[0];
@@ -604,15 +609,22 @@ int ipset_del(const char *ipsetname, const unsigned char addr[], int addr_len)
 
 unsigned char *SSL_SHA256(const unsigned char *d, size_t n, unsigned char *md)
 {
-	SHA256_CTX c;
 	static unsigned char m[SHA256_DIGEST_LENGTH];
 
 	if (md == NULL)
 		md = m;
-	SHA256_Init(&c);
-	SHA256_Update(&c, d, n);
-	SHA256_Final(md, &c);
-	OPENSSL_cleanse(&c, sizeof(c));
+
+	EVP_MD_CTX* ctx = EVP_MD_CTX_create();
+	if (ctx == NULL) {
+		return NULL;
+	}
+
+	EVP_MD_CTX_init(ctx);
+	EVP_DigestInit_ex(ctx, EVP_sha256(), NULL);
+	EVP_DigestUpdate(ctx, d, n);
+	EVP_DigestFinal_ex(ctx, m, NULL);
+	EVP_MD_CTX_destroy(ctx);
+
 	return (md);
 }
 
@@ -733,7 +745,11 @@ void SSL_CRYPTO_thread_setup(void)
 		pthread_mutex_init(&(lock_cs[i]), NULL);
 	}
 
+#if OPENSSL_API_COMPAT < 0x10000000
 	CRYPTO_set_id_callback(_pthreads_thread_id);
+#else
+	CRYPTO_THREADID_set_callback(_pthreads_thread_id);
+#endif
 	CRYPTO_set_locking_callback(_pthreads_locking_callback);
 }
 
@@ -1008,4 +1024,51 @@ uint64_t get_free_space(const char *path)
 	size = (uint64_t)buf.f_frsize * buf.f_bavail;
 
 	return size;
+}
+
+struct backtrace_state {
+	void **current;
+	void **end;
+};
+
+static _Unwind_Reason_Code unwind_callback(struct _Unwind_Context *context, void *arg)
+{
+	struct backtrace_state *state = (struct backtrace_state *)(arg);
+	uintptr_t pc = _Unwind_GetIP(context);
+	if (pc) {
+		if (state->current == state->end) {
+			return _URC_END_OF_STACK;
+		} else {
+			*state->current++ = (void *)(pc);
+		}
+	}
+	return _URC_NO_REASON;
+}
+
+void print_stack(void)
+{
+	const size_t max_buffer = 30;
+	void *buffer[max_buffer];
+
+	struct backtrace_state state = {buffer, buffer + max_buffer};
+	_Unwind_Backtrace(unwind_callback, &state);
+	int frame_num = state.current - buffer;
+	if (frame_num == 0) {
+		return;
+	}
+	
+	tlog(TLOG_FATAL, "Stack:");
+	for (int idx = 0; idx < frame_num; ++idx) {
+		const void *addr = buffer[idx];
+		const char *symbol = "";
+
+		Dl_info info;
+		memset(&info, 0, sizeof(info));
+		if (dladdr(addr, &info) && info.dli_sname) {
+			symbol = info.dli_sname;
+		}
+
+		void *offset = (void *)((char *)(addr) - (char *)(info.dli_fbase));
+		tlog(TLOG_FATAL, "#%.2d: %p %s from %s+%p", idx + 1, addr, symbol, info.dli_fname, offset);
+	}
 }

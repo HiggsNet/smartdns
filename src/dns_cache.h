@@ -62,8 +62,8 @@ struct dns_cache_addr {
 	struct dns_cache_data_head head;
 	struct dns_cache_addr_data {
 		unsigned int cname_ttl;
-		char cname[DNS_MAX_CNAME_LEN];
 		char soa;
+		char cname[DNS_MAX_CNAME_LEN];
 		union {
 			unsigned char ipv4_addr[DNS_RR_A_LEN];
 			unsigned char ipv6_addr[DNS_RR_AAAA_LEN];
@@ -142,6 +142,8 @@ typedef void dns_cache_preinvalid_callback(struct dns_cache *dns_cache);
 void dns_cache_invalidate(dns_cache_preinvalid_callback callback, int ttl_pre);
 
 int dns_cache_get_ttl(struct dns_cache *dns_cache);
+
+int dns_cache_get_cname_ttl(struct dns_cache *dns_cache);
 
 int dns_cache_is_soa(struct dns_cache *dns_cache);
 
